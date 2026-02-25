@@ -1,11 +1,6 @@
-Flask==2.3.3
-psycopg2-binary==2.9.7
-requests==2.31.0
-pandas==2.0.3
-streamlit==1.28.0
-plotly==5.17.0
-python-dotenv==1.0.0
-folium==0.14.0
-streamlit-folium==0.14.0
-pyngrok==5.2.3
-gunicorn==21.2.0
+streamlit
+requests
+pandas
+plotly
+folium
+streamlit-folium
