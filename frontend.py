@@ -11,7 +11,7 @@ import plotly.express as px
 import folium
 from streamlit_folium import st_folium
 from config import API_URL
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 st.set_page_config(page_title="A.H.H.H. Blockage Detection", page_icon="🌊", layout="wide")
 st.title("A.H.H.H. Blockage Detection System")
@@ -97,12 +97,13 @@ def create_sensor_map(df):
 
 raw_data = fetch_data()
 
-# Pre-calculate Current PST Time for Health Checks
-current_pst = datetime.utcnow() + timedelta(hours=8)
+# Pre-calculate Current PST Time for Health Checks (Fixed Deprecation Warning)
+current_pst = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(hours=8)
 
 if raw_data:
     df_all = pd.DataFrame(raw_data)
-    df_all['recorded_at'] = pd.to_datetime(df_all['recorded_at'])
+    # Coerce errors so invalid dates become NaT instead of crashing
+    df_all['recorded_at'] = pd.to_datetime(df_all['recorded_at'], errors='coerce')
     df_all = df_all.sort_values('recorded_at')
     
     # Filter for active sensor for the main charts
@@ -139,35 +140,39 @@ if raw_data:
             
         st.markdown("---")
         
-        # --- NEW SYSTEM HEALTH MODULE ---
+        # --- NEW SYSTEM HEALTH MODULE (NaN Proof) ---
         st.subheader("🖥️ System & Device Health")
         
-        # Group all sensors to figure out which are active vs inactive
         active_sensors = []
         inactive_sensors = []
         
         last_pings = df_all.groupby('sensor_id')['recorded_at'].max()
         for s_id, last_time in last_pings.items():
-            delta_seconds = (current_pst - last_time).total_seconds()
-            if delta_seconds <= 120:  # 2 minute threshold
-                active_sensors.append((s_id, delta_seconds))
+            if pd.isna(last_time):
+                inactive_sensors.append((s_id, "Unknown"))
             else:
-                inactive_sensors.append((s_id, delta_seconds))
+                delta_seconds = (current_pst - last_time).total_seconds()
+                if delta_seconds <= 120:  
+                    active_sensors.append((s_id, int(delta_seconds)))
+                else:
+                    inactive_sensors.append((s_id, int(delta_seconds/60)))
         
         col_sys1, col_sys2, col_sys3 = st.columns(3)
         
-        # Determine internal states based on the main Active sensor's latest ping
-        time_since_ping = (current_pst - latest['recorded_at']).total_seconds()
-        is_active = time_since_ping <= 120
         has_gps = pd.notna(latest.get('latitude')) and pd.notna(latest.get('longitude'))
         has_power = latest.get('power_consumption_watts', 0.0) > 0
         
         with col_sys1:
             st.markdown("**📡 Network Status**")
-            if is_active:
-                st.success(f"🟢 Active (Last ping: {int(time_since_ping)}s ago)")
+            if pd.isna(latest['recorded_at']):
+                st.error("🔴 Offline (Last ping: Unknown)")
             else:
-                st.error(f"🔴 Offline (Last ping: {int(time_since_ping/60)}m ago)")
+                time_since_ping = (current_pst - latest['recorded_at']).total_seconds()
+                is_active = time_since_ping <= 120
+                if is_active:
+                    st.success(f"🟢 Active (Last ping: {int(time_since_ping)}s ago)")
+                else:
+                    st.error(f"🔴 Offline (Last ping: {int(time_since_ping/60)}m ago)")
                 
         with col_sys2:
             st.markdown("**🛰️ GPS Status**")
@@ -189,7 +194,7 @@ if raw_data:
             st.markdown("##### 🟢 Active Sensors")
             if active_sensors:
                 for s in active_sensors:
-                    st.write(f"- {s[0]} *(Pinged {int(s[1])}s ago)*")
+                    st.write(f"- {s[0]} *(Pinged {s[1]}s ago)*")
             else:
                 st.write("*None*")
                 
@@ -197,7 +202,10 @@ if raw_data:
             st.markdown("##### 🔴 Inactive Sensors")
             if inactive_sensors:
                 for s in inactive_sensors:
-                    st.write(f"- {s[0]} *(Offline for {int(s[1]/60)} mins)*")
+                    if s[1] == "Unknown":
+                        st.write(f"- {s[0]} *(Offline: Unknown)*")
+                    else:
+                        st.write(f"- {s[0]} *(Offline for {s[1]} mins)*")
             else:
                 st.write("*None*")
 
@@ -260,7 +268,9 @@ if raw_data:
         with col1:
             st.subheader("📈 Water Level Over Time")
             fig_trend = go.Figure()
-            fig_trend.add_trace(go.Scatter(x=df['recorded_at'], y=df['water_level_cm'], mode='lines+markers',
+            # Only plot valid dates to avoid chart rendering errors
+            valid_dates_df = df.dropna(subset=['recorded_at'])
+            fig_trend.add_trace(go.Scatter(x=valid_dates_df['recorded_at'], y=valid_dates_df['water_level_cm'], mode='lines+markers',
                                           name='Level', line=dict(color='#0066cc', width=2), fill='tozeroy'))
             fig_trend.add_hline(y=WARN_THRESHOLD, line_dash="dash", line_color="yellow", annotation_text="Warning (25%)")
             fig_trend.add_hline(y=ALERT_THRESHOLD, line_dash="dash", line_color="orange", annotation_text="Alert (50%)")
