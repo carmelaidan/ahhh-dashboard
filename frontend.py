@@ -374,7 +374,7 @@ else:
             
     with col_list2:
         st.markdown("##### 🔴 Inactive Sensors")
-        st.write("*None*")
+        st.write(f"- {ACTIVE_SENSOR_ID} *(Awaiting first connection...)*")
 
     st.markdown("---")
     
