@@ -65,7 +65,7 @@ def get_marker_color(capacity_pct):
     else:
         return "green"
 
-def create_sensor_map(df):
+def create_sensor_map(df, is_active):
     try:
         if df.empty or 'latitude' not in df.columns:
             return None
@@ -80,14 +80,18 @@ def create_sensor_map(df):
         lon = float(latest['longitude'])
         
         m = folium.Map(location=[lat, lon], zoom_start=16, tiles="OpenStreetMap")
-        folium.Circle(location=[lat, lon], radius=200, color='blue', fill=True, fillOpacity=0.1, weight=2).add_to(m)
         
-        marker_color = get_marker_color(latest['capacity_pct'])
+        # If offline, gray out the map elements
+        circle_color = 'blue' if is_active else 'gray'
+        marker_color = get_marker_color(latest['capacity_pct']) if is_active else 'lightgray'
+        status_text = f"Level: {latest['water_level_cm']:.1f}cm" if is_active else "Status: OFFLINE"
+        
+        folium.Circle(location=[lat, lon], radius=200, color=circle_color, fill=True, fillOpacity=0.1, weight=2).add_to(m)
         
         folium.Marker(
             location=[lat, lon],
-            popup=f"<b>{latest['sensor_id']}</b><br>Level: {latest['water_level_cm']:.1f}cm ({latest['capacity_pct']:.1f}%)",
-            icon=folium.Icon(color=marker_color, icon="tint", prefix="fa")
+            popup=f"<b>{latest['sensor_id']}</b><br>{status_text}",
+            icon=folium.Icon(color=marker_color, icon="tint" if is_active else "ban", prefix="fa")
         ).add_to(m)
         
         return m
@@ -97,19 +101,16 @@ def create_sensor_map(df):
 
 raw_data = fetch_data()
 
-# Pre-calculate Current PST Time for Health Checks (Fixed Deprecation Warning)
+# Current PST Time
 current_pst = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(hours=8)
 
 if raw_data:
     df_all = pd.DataFrame(raw_data)
-    # Coerce errors so invalid dates become NaT instead of crashing
     df_all['recorded_at'] = pd.to_datetime(df_all['recorded_at'], errors='coerce')
     df_all = df_all.sort_values('recorded_at')
     
-    # Filter for active sensor for the main charts
     df = df_all[df_all['sensor_id'] == ACTIVE_SENSOR_ID].copy()
     
-    # Ensure alert fields exist
     if 'capacity_percentage' not in df.columns:
         df['capacity_percentage'] = (df['water_level_cm'] / BASIN_HEIGHT_CM) * 100
     if 'alert_status' not in df.columns:
@@ -121,26 +122,41 @@ if raw_data:
     
     if not df.empty:
         latest = df.iloc[-1]
+        
+        # --- GLOBAL ACTIVE STATE CALCULATION ---
+        latest_time = latest['recorded_at']
+        time_since_ping = None
+        is_system_active = False
+
+        if pd.notna(latest_time):
+            time_since_ping = (current_pst - latest_time).total_seconds()
+            is_system_active = time_since_ping <= 120
+            
         status_text, status_color = get_status_color(latest['capacity_pct'])
         
-        # Metrics
+        # --- Metrics Display (Masked if Offline) ---
         col1, col2, col3, col4, col5 = st.columns(5)
         with col1:
-            st.metric("Latest Reading", f"{latest['water_level_cm']} cm", status_text, delta_color="off")
+            if is_system_active:
+                st.metric("Latest Reading", f"{latest['water_level_cm']} cm", status_text, delta_color="off")
+            else:
+                st.metric("Latest Reading", "-- cm", "🔴 OFFLINE", delta_color="off")
         with col2:
             avg_level = df['water_level_cm'].mean()
-            st.metric("Average", f"{avg_level:.1f} cm", f"{latest['water_level_cm'] - avg_level:.1f} cm")
+            st.metric("Average", f"{avg_level:.1f} cm")
         with col3:
             st.metric("Peak", f"{df['water_level_cm'].max():.1f} cm")
         with col4:
             st.metric("Minimum", f"{df['water_level_cm'].min():.1f} cm")
         with col5:
-            latest_power = latest.get('power_consumption_watts', 0.0)
-            st.metric("Power", f"{latest_power:.2f} W")
+            if is_system_active:
+                st.metric("Power", f"{latest.get('power_consumption_watts', 0.0):.2f} W")
+            else:
+                st.metric("Power", "-- W")
             
         st.markdown("---")
         
-        # --- NEW SYSTEM HEALTH MODULE (NaN Proof) ---
+        # --- System Health Display (Masked if Offline) ---
         st.subheader("🖥️ System & Device Health")
         
         active_sensors = []
@@ -164,31 +180,31 @@ if raw_data:
         
         with col_sys1:
             st.markdown("**📡 Network Status**")
-            if pd.isna(latest['recorded_at']):
+            if pd.isna(latest_time) or time_since_ping is None:
                 st.error("🔴 Offline (Last ping: Unknown)")
+            elif is_system_active:
+                st.success(f"🟢 Active (Last ping: {int(time_since_ping)}s ago)")
             else:
-                time_since_ping = (current_pst - latest['recorded_at']).total_seconds()
-                is_active = time_since_ping <= 120
-                if is_active:
-                    st.success(f"🟢 Active (Last ping: {int(time_since_ping)}s ago)")
-                else:
-                    st.error(f"🔴 Offline (Last ping: {int(time_since_ping/60)}m ago)")
+                st.error(f"🔴 Offline (Last ping: {int(time_since_ping/60)}m ago)")
                 
         with col_sys2:
             st.markdown("**🛰️ GPS Status**")
-            if has_gps:
+            if not is_system_active:
+                st.error("🔴 Offline")
+            elif has_gps:
                 st.success(f"🟢 Locked ({latest['latitude']}, {latest['longitude']})")
             else:
                 st.warning("🟡 Searching (No line of sight)")
                 
         with col_sys3:
             st.markdown("**🔋 Power Sensor**")
-            if has_power:
+            if not is_system_active:
+                st.error("🔴 Offline")
+            elif has_power:
                 st.success(f"🟢 Active ({latest['power_consumption_watts']:.3f} W)")
             else:
                 st.error("🔴 Inactive / 0.0 W")
 
-        # Active / Inactive Sensor Lists
         col_list1, col_list2 = st.columns(2)
         with col_list1:
             st.markdown("##### 🟢 Active Sensors")
@@ -211,10 +227,12 @@ if raw_data:
 
         st.markdown("---")
         
-        # Alert section
+        # --- Alert Section Display (Masked if Offline) ---
         col_alert1, col_alert2 = st.columns([2, 1])
         with col_alert1:
-            if latest.get('alert_status', False):
+            if not is_system_active:
+                st.error("🔴 SYSTEM OFFLINE - Sensor disconnected. Cannot verify current water level.")
+            elif latest.get('alert_status', False):
                 alert_type = latest.get('alert_type', 'unknown')
                 if alert_type == 'blockage_detected':
                     st.error(f"🚨 BLOCKAGE DETECTED! ({latest['capacity_pct']:.1f}% capacity) - Type: blockage_detected")
@@ -233,28 +251,24 @@ if raw_data:
                     st.success(f"🟢 NORMAL - Basin at {latest['capacity_pct']:.1f}% capacity")
         
         with col_alert2:
-            st.metric("Alert Status", "🚨 ACTIVE" if latest.get('alert_status', False) else "✓ Normal", 
-                     latest.get('alert_type', 'N/A'))
+            if not is_system_active:
+                st.metric("Alert Status", "🔴 UNKNOWN")
+            else:
+                st.metric("Alert Status", "🚨 ACTIVE" if latest.get('alert_status', False) else "✓ Normal", 
+                         latest.get('alert_type', 'N/A'))
         
         st.markdown("---")
         
         st.subheader("🗺️ Sensor Location Map")
         try:
-            sensor_map = create_sensor_map(df)
+            sensor_map = create_sensor_map(df, is_system_active)
             if sensor_map:
                 st_folium(sensor_map, width=1400, height=500)
             else:
-                st.warning("""
-                ⏳ **GPS Not Yet Locked**
-                The hardware is searching for GPS coordinates. Once GPS locks, the map will update automatically.
-                """)
+                st.warning("⏳ **GPS Not Yet Locked** - Awaiting live coordinates.")
                 try:
                     m_fallback = folium.Map(location=[14.5994, 120.9842], zoom_start=16, tiles="OpenStreetMap")
-                    folium.Marker(
-                        location=[14.5994, 120.9842],
-                        popup="Standby Location - Awaiting GPS",
-                        icon=folium.Icon(color="blue", icon="info", prefix="fa")
-                    ).add_to(m_fallback)
+                    folium.Marker(location=[14.5994, 120.9842], popup="Standby Location", icon=folium.Icon(color="gray", icon="info", prefix="fa")).add_to(m_fallback)
                     st_folium(m_fallback, width=1400, height=500)
                 except:
                     st.info("📍 Default: Manila, Philippines")
@@ -263,12 +277,10 @@ if raw_data:
         
         st.markdown("---")
         
-        # Charts section
         col1, col2 = st.columns(2)
         with col1:
             st.subheader("📈 Water Level Over Time")
             fig_trend = go.Figure()
-            # Only plot valid dates to avoid chart rendering errors
             valid_dates_df = df.dropna(subset=['recorded_at'])
             fig_trend.add_trace(go.Scatter(x=valid_dates_df['recorded_at'], y=valid_dates_df['water_level_cm'], mode='lines+markers',
                                           name='Level', line=dict(color='#0066cc', width=2), fill='tozeroy'))
@@ -288,7 +300,6 @@ if raw_data:
         
         st.markdown("---")
         
-        # Alert history
         st.subheader("🚨 Alert History")
         alerts_df = df[df['alert_status'] == True].copy() if 'alert_status' in df.columns else pd.DataFrame()
         
@@ -310,34 +321,26 @@ if raw_data:
         
         st.markdown("---")
         
-        # Download options
         st.subheader("💾 Download/Export Data")
         col1, col2, col3 = st.columns(3)
         with col1:
             csv = df.to_csv(index=False)
-            st.download_button(" Download CSV", csv,
-                              file_name=f"water_levels_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                              mime="text/csv")
+            st.download_button(" Download CSV", csv, file_name=f"water_levels_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv", mime="text/csv")
         with col2:
             try:
                 api_base = API_URL.rsplit('/api/', 1)[0]
                 response = requests.get(f"{api_base}/api/export/geojson", timeout=5)
                 if response.status_code == 200:
-                    st.download_button("️ Download GeoJSON", response.text,
-                                      file_name=f"water_levels_{datetime.now().strftime('%Y%m%d_%H%M%S')}.geojson",
-                                      mime="application/json")
+                    st.download_button("️ Download GeoJSON", response.text, file_name=f"water_levels_{datetime.now().strftime('%Y%m%d_%H%M%S')}.geojson", mime="application/json")
             except:
                 st.info("GeoJSON unavailable")
-        
         with col3:
             st.info("💡 Import GeoJSON into QGIS for spatial analysis")
 
-# Standby State / Footer
 else:
     st.info("📡 System Active: Listening for live hardware transmissions...")
     st.markdown("---")
 
-# --- NEW SYSTEM MANAGEMENT MODULE ---
 st.markdown("---")
 st.subheader("⚙️ System Management")
 
